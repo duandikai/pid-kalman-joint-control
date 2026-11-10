@@ -3,8 +3,8 @@ function results = main(output_dir, make_figures)
 %   main                         runs every experiment and exports data/plots.
 %   results = main('results', false) runs without a graphics display.
 % All functions are in this file; no MATLAB toolboxes are required.
-% Read README.md and MANUSCRIPT_AUDIT.md before using results in a submission.
-% This is a reconstruction from Manuscript_1103.docx and the archived source,
+% See README.md for reproduction instructions and manuscript status.
+% This is a reconstruction from Manuscript_1103.docx and the original source,
 % not a recovered copy of the code that originally produced the manuscript.
 
 root_dir = fileparts(mfilename('fullpath'));
@@ -22,7 +22,7 @@ if exist(noise_file,'file')
     assert(all(isfinite(noise_table(:))) && max(abs(noise_table(:,1)-t))<1e-12, ...
         'Noise file contains invalid values or time points.');
     noise = noise_table(:,2:3);
-    noise_source = 'Bundled data/noise_standard.csv; see data/PROVENANCE.md';
+    noise_source = 'Bundled data/noise_standard.csv; see README.md';
 else
     % One common realization, interleaved encoder then gyro, for every run.
     % Native randn sequences may differ between MATLAB and GNU Octave.
