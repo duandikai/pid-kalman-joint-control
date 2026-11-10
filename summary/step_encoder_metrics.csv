@@ -1,0 +1,17 @@
+metric,value
+angle_rmse_deg,3.0182937244848245
+velocity_rmse_deg_s,3.7063255975980747
+angle_max_abs_deg,5.2181293522600081
+velocity_max_abs_deg_s,11.438930380860247
+voltage_rms_V,17.82468365431091
+current_rms_A,7.8651513710647638
+encoder_rmse_deg,0.20050769220391704
+gyro_rmse_deg_s,0.49489929542627853
+kf_angle_rmse_deg,0.064620870382258069
+kf_velocity_rmse_deg_s,0.38769156454036363
+encoder_rmse_full_deg,0.19999349877251874
+gyro_rmse_full_deg_s,0.49427853015512807
+kf_angle_rmse_full_deg,0.065868667893894658
+kf_velocity_rmse_full_deg_s,0.38611894652397521
+settling_s,4.7690000000000001
+overshoot_pct,0.047523242551779088

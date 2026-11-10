@@ -1,0 +1,4 @@
+results/
+my_results/
+__pycache__/
+*.asv

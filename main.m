@@ -1,358 +1,435 @@
-clear; clc; close all;
-rng(42);  % 固定随机种子，确保仿真结果可复现
+function results = main(output_dir, make_figures)
+% MAIN Reproducible single-joint PID/Kalman-filter simulation.
+%   main                         runs every experiment and exports data/plots.
+%   results = main('results', false) runs without a graphics display.
+% All functions are in this file; no MATLAB toolboxes are required.
+% Read README.md and MANUSCRIPT_AUDIT.md before using results in a submission.
+% This is a reconstruction from Manuscript_1103.docx and the archived source,
+% not a recovered copy of the code that originally produced the manuscript.
 
-%% 2. 系统参数设置（严格遵循文档单关节机器人模型，并加入MuJoCo/Webots模拟的额外参数）
-% 机器人关节动力学参数（文档隐含单关节旋转特性）
-J = 0.5;          % Moment of Inertia (kg·m²)
-B = 0.2;          % Damping Coefficient (N·m·s/rad) - 视为粘性阻尼
-Kt = 1.0;         % Torque Constant (N·m/A)
-Ke = 1.0;         % Back-EMF Constant (V·s/rad)
-R = 2.0;          % Armature Resistance (Ω)
-
-% ** MuJoCo/Webots 风格的额外物理参数 **
-F_coulomb = 0.8;  % Coulomb Friction Torque (N·m) - 模拟静态和动态摩擦
-m = 1.0;          % Link Mass (kg) - 假设为单连杆
-L = 0.5;          % Link Length (m) - 假设质心在连杆一半处
-g = 9.81;         % Gravitational Acceleration (m/s²)
-disturbance_amplitude = 1.5; % External Disturbance Torque Amplitude (N·m)
-disturbance_frequency = 5; % External Disturbance Torque Frequency (Hz)
-
-% 控制时间参数（文档仿真实验时间尺度）
-t_start = 0;      % 起始时间
-t_end = 5;        % 结束时间
-dt = 0.001;       % 时间步长
-t = t_start:dt:t_end;
-N = length(t);    % 数据长度
-
-% 参考轨迹（文档“动态跟踪需求”：阶跃+正弦复合信号）
-theta_ref_deg = 30 * ones(1, N) + 5 * sin(2 * pi * t);  % 参考角度 (deg)
-theta_ref_rad = deg2rad(theta_ref_deg);                 % 转换为弧度（匹配动力学运算）
-
-% 传感器噪声参数（文档“多传感器融合必要性”设定）
-gyro_noise_std = 0.5;    % 陀螺仪角度噪声标准差 (deg)
-enc_noise_std = 0.2;     % 编码器角度噪声标准差 (deg)
-
-% PID控制器参数（文档并联结构，Ziegler-Nichols整定）
-Kp = 8.0;    % 比例增益
-Ti = 0.4;    % 积分时间 (s)
-Td = 0.1;    % 微分时间 (s)
-Ki = Kp / Ti;% 积分增益（对应文档Kc/Ti）
-Kd = Kp * Td;% 微分增益（对应文档Kc*Td）
-
-% 卡尔曼滤波参数（文档“传感器融合核心算法”，状态向量：[角度; 角速度]）
-A = [1, dt; 0, 1];                          % 2×2状态转移矩阵
-% 假设B_kal只用于控制输入带来的力矩，未建模的扰动由Q覆盖
-B_kal = [dt^2/(2*J); dt/J];                 % 2×1输入矩阵（避免与其他变量重名）
-H = [1, 0; 1, 0];                           % 2×2观测矩阵（双传感器数据关联）
-Q = diag([0.005, 0.05]);                    % 2×2过程噪声协方差 (适当增加Q以应对未建模的扰动)
-R_kal = diag([deg2rad(gyro_noise_std)^2, deg2rad(enc_noise_std)^2]);% 2×2测量噪声协方差
-P0 = diag([1, 1]);                          % 2×2初始协方差矩阵
-
-%% 3. 变量初始化（文档单关节模型，1行N列标量数组，杜绝维度冲突）
-% 机器人状态变量（文档“动力学输出量”）
-theta_actual_rad = zeros(1, N);  % 实际角度 (rad)
-omega_actual_rad = zeros(1, N);  % 实际角速度 (rad/s)
-current = zeros(1, N);           % 电枢电流 (A)
-motor_torque_output = zeros(1, N); % 电机输出力矩 (N·m)
-
-% ** MuJoCo/Webots 风格的额外力矩历史记录 **
-friction_torque_hist = zeros(1, N);
-gravity_torque_hist = zeros(1, N);
-disturbance_torque_hist = zeros(1, N);
-
-
-% 传感器测量值（文档“多传感器原始数据”）
-theta_gyro_rad = zeros(1, N);    % 陀螺仪测量角度 (rad)
-theta_enc_rad = zeros(1, N);     % 编码器测量角度 (rad)
-
-% PID控制变量（文档“并联PID计算中间量”）
-error_pid_rad = zeros(1, N);     % PID角度误差 (rad)
-error_int = 0;                   % 积分误差累积（标量）
-error_prev_rad = 0;              % 上一时刻误差（标量）
-u_pid = zeros(1, N);             % PID控制输出电压 (V)
-
-% 卡尔曼滤波变量（文档“传感器融合计算量”）
-x_est = zeros(2, N);             % 估计状态 [角度; 角速度] (2行N列)
-x_pred = zeros(2, N);            % 预测状态 (2行N列)
-P_est = zeros(2, 2, N);          % 估计协方差 (2×2×N)
-P_pred = zeros(2, 2, N);         % 预测协方差 (2×2×N)
-K = zeros(2, 2, N);              % 卡尔曼增益 (2×2×N)
-theta_fused_rad = zeros(1, N);   % 融合后角度 (rad)
-omega_fused_rad = zeros(1, N);   % 融合后角速度 (rad/s)
-
-% 初始状态（文档“机器人初始静止”假设）
-theta_actual_rad(1) = 0;                  % 初始角度为0
-omega_actual_rad(1) = 0;                  % 初始角速度为0
-x_est(:, 1) = [theta_actual_rad(1); omega_actual_rad(1)];  % 初始估计状态
-P_est(:, :, 1) = P0;                     % 初始协方差
-
-%% 4. 系统仿真循环（严格匹配文档“PID控制+传感器融合”逻辑，并加入MuJoCo/Webots风格的动力学）
-for k = 2:N
-    % ---------------------- 步骤1：PID控制器计算（文档并联结构，全标量运算） ----------------------
-    % PID控制器根据融合后的估计值进行反馈
-    error_pid_rad(1, k) = theta_ref_rad(1, k) - theta_fused_rad(1, k-1); % 使用融合角度作为反馈
-    error_int = error_int + error_pid_rad(1, k) * dt;                      % 标量积分累积
-    error_diff_rad = (error_pid_rad(1, k) - error_prev_rad) / dt;          % 标量微分
-    u_pid(1, k) = Kp * error_pid_rad(1, k) + Ki * error_int + Kd * error_diff_rad;  % 标量电压
-    error_prev_rad = error_pid_rad(1, k);                                  % 更新标量误差
-
-    % ---------------------- 步骤2：机器人动力学模型（文档核心公式，加入MuJoCo/Webots风格细节） ----------------------
-    % 电机模型
-    u_pid_limited = max(min(u_pid(1, k), 24), -24); % 限制电压
-    back_emf = Ke * omega_actual_rad(1, k-1);
-    current(1, k) = (u_pid_limited - back_emf) / R;
-    current(1, k) = max(min(current(1, k), 10), -10); % 限制电流
-    motor_torque = Kt * current(1, k);
-    motor_torque_output(1, k) = motor_torque; % 记录电机输出力矩
-
-    % ** 引入 MuJoCo/Webots 风格的物理效应 **
-    % 粘性摩擦 (Viscous Friction)
-    viscous_friction_torque = B * omega_actual_rad(1, k-1);
-
-    % 库仑摩擦 (Coulomb Friction)
-    coulomb_friction_torque = F_coulomb * sign(omega_actual_rad(1, k-1));
-    if abs(omega_actual_rad(1, k-1)) < 1e-3 % 接近静止时，库仑摩擦防止滑动
-        coulomb_friction_torque = 0; % 或者引入静摩擦模型，这里简化处理
-    end
-    friction_torque_hist(1, k) = viscous_friction_torque + coulomb_friction_torque;
-
-    % 重力力矩 (Gravitational Torque) - 假设关节水平时角度为0，垂直向下为pi/2
-    % 这里的重力力矩假设是一个简化的单摆模型，sin(theta)当theta=0时重力矩为0，theta=pi/2时最大
-    gravity_torque = m * g * L * sin(theta_actual_rad(1, k-1));
-    gravity_torque_hist(1, k) = gravity_torque;
-
-    % 外部扰动力矩 (External Disturbance Torque)
-    disturbance_torque = disturbance_amplitude * sin(2 * pi * disturbance_frequency * t(k));
-    disturbance_torque_hist(1, k) = disturbance_torque;
-
-    % 计算净力矩
-    net_torque = motor_torque - viscous_friction_torque - coulomb_friction_torque - gravity_torque - disturbance_torque;
-
-    % 角速度更新
-    angular_acc = net_torque / J;
-    omega_actual_rad(1, k) = omega_actual_rad(1, k-1) + angular_acc * dt;
-    % 角度更新
-    theta_actual_rad(1, k) = theta_actual_rad(1, k-1) + omega_actual_rad(1, k) * dt;
-
-    % ---------------------- 步骤3：传感器测量（文档“添加噪声”需求，标量测量值） ----------------------
-    theta_gyro_rad(1, k) = theta_actual_rad(1, k) + normrnd(0, deg2rad(gyro_noise_std));
-    theta_enc_rad(1, k) = theta_actual_rad(1, k) + normrnd(0, deg2rad(enc_noise_std));
-    z = [theta_gyro_rad(1, k); theta_enc_rad(1, k)];  % 2×1测量向量（匹配卡尔曼维度）
-
-    % ---------------------- 步骤4：卡尔曼滤波（文档“预测+更新”两阶段） ----------------------
-    % 预测步骤
-    % 注意：B_kal * motor_torque 假设 Kalman Filter 对电机的实际输出力矩有一定的模型认知。
-    % 未建模的干扰 (摩擦、重力、外部扰动) 通过 Q (过程噪声协方差) 来覆盖。
-    x_pred(:, k) = A * x_est(:, k-1) + B_kal * motor_torque_output(1, k);
-    P_pred(:, :, k) = A * P_est(:, :, k-1) * A' + Q;
-    
-    % 更新步骤
-    K(:, :, k) = P_pred(:, :, k) * H' / (H * P_pred(:, :, k) * H' + R_kal);
-    x_est(:, k) = x_pred(:, k) + K(:, :, k) * (z - H * x_pred(:, k));
-    P_est(:, :, k) = (eye(2) - K(:, :, k) * H) * P_pred(:, :, k);
-    
-    theta_fused_rad(1, k) = x_est(1, k);  % 提取融合后角度（标量）
-    omega_fused_rad(1, k) = x_est(2, k);  % 提取融合后角速度（标量）
-
-end
-
-%% 5. 单位转换（文档“角度以deg展示”需求）
-theta_actual_deg = rad2deg(theta_actual_rad);
-theta_fused_deg = rad2deg(theta_fused_rad);
-theta_gyro_deg = rad2deg(theta_gyro_rad);
-theta_enc_deg = rad2deg(theta_enc_rad);
-% PID误差现在是根据融合角度计算的
-error_pid_deg = rad2deg(theta_ref_rad - theta_fused_rad); 
-omega_actual_deg = rad2deg(omega_actual_rad);
-omega_fused_deg = rad2deg(omega_fused_rad);
-omega_ref_deg = rad2deg(5 * 2 * pi * cos(2 * pi * t));  % 参考角速度 (deg/s)
-
-%% 6. 绘制原始文档中的10张仿真图（线宽2，量化标注支撑文档结论）
-% 图1：参考轨迹与实际角度对比（文档“PID跟踪性能”验证）
-figure(1); hold on; grid on; grid minor;
-p1_1 = plot(t, theta_ref_deg, 'r-', 'LineWidth', 2.5, 'DisplayName', 'Reference Angle (30°+5sin(2πt))');
-p1_2 = plot(t, theta_actual_deg, 'b-o', 'LineWidth', 2, 'MarkerSize', 1.5, 'DisplayName', 'Actual Angle');
-xline(1, 'k--', 'Steady State Start (t=1s)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-text(3, 32, ['Steady State Error: ', num2str(round(abs(error_pid_deg(1, end)), 3)), ' deg'], 'FontSize', 10);
-xlabel('Time (s)', 'FontSize', 11); ylabel('Angle (deg)', 'FontSize', 11);
-title('Robotic Joint Angle Tracking Performance with PID Control', 'FontSize', 12);
-legend([p1_1, p1_2], 'Location', 'northwest', 'FontSize', 9);
-
-% 图2：PID控制误差曲线（文档“PID稳态精度”验证）
-figure(2); hold on; grid on; grid minor;
-p2_1 = plot(t, error_pid_deg, 'm-', 'LineWidth', 2, 'DisplayName', 'PID Angle Error (Fused)');
-yline(0.5, 'k--', 'Error Upper Bound (+0.5deg)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(-0.5, 'k--', 'Error Lower Bound (-0.5deg)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-settling_time_threshold = 0.5; % deg
-settling_start_time_for_check = 0.5; % s, starting point to check for settling
-error_indices_after_start = find(t >= settling_start_time_for_check);
-error_after_start_check = abs(error_pid_deg(error_indices_after_start));
-last_exit_idx_in_subset = find(error_after_start_check > settling_time_threshold, 1, 'last');
-
-if isempty(last_exit_idx_in_subset)
-    settling_time = settling_start_time_for_check;
+root_dir = fileparts(mfilename('fullpath'));
+if nargin < 1 || isempty(output_dir), output_dir = fullfile(root_dir,'results'); end
+if nargin < 2, make_figures = true; end
+if ~exist(output_dir,'dir'), mkdir(output_dir); end
+data_dir = fullfile(output_dir,'data');
+if ~exist(data_dir,'dir'), mkdir(data_dir); end
+cfg = configuration();
+t = (0:cfg.dt:cfg.duration)';
+noise_file = fullfile(root_dir,'data','noise_standard.csv');
+if exist(noise_file,'file')
+    noise_table = dlmread(noise_file,',',1,0);
+    assert(isequal(size(noise_table),[numel(t),3]),'Noise file has the wrong dimensions.');
+    assert(all(isfinite(noise_table(:))) && max(abs(noise_table(:,1)-t))<1e-12, ...
+        'Noise file contains invalid values or time points.');
+    noise = noise_table(:,2:3);
+    noise_source = 'Bundled data/noise_standard.csv; see data/PROVENANCE.md';
 else
-    settling_time = t(error_indices_after_start(last_exit_idx_in_subset) + 1);
+    % One common realization, interleaved encoder then gyro, for every run.
+    % Native randn sequences may differ between MATLAB and GNU Octave.
+    if exist('rng','file')
+        rng(cfg.seed,'twister');
+        generator='rng(42,twister)/randn';
+    else
+        randn('state',cfg.seed); % GNU Octave 6 compatibility.
+        generator='randn(state,42)';
+    end
+    noise = [0,0; reshape(randn(2*(numel(t)-1),1),2,[])'];
+    noise_source = ['Generated by ',generator,' in ',version];
+end
+assert(all(noise(1,:)==0),'The initialization row must have zero noise.');
+write_numeric(fullfile(data_dir,'noise_standard.csv'), ...
+    {'time_s','encoder_standard_normal','gyro_standard_normal'},[t,noise]);
+
+methods = {'encoder','lpf','kf'};
+tracking = cell(3,1); steps = cell(3,1); table2 = zeros(3,6);
+for j=1:3
+    tracking{j} = simulate(cfg,methods{j},'sine',1,1,1,noise);
+    steps{j} = simulate(cfg,methods{j},'step',1,1,1,noise);
+    m = tracking{j}.metrics; sm = steps{j}.metrics;
+    table2(j,:) = [m.angle_rmse_deg,m.velocity_rmse_deg_s, ...
+        sm.settling_s,sm.overshoot_pct,m.voltage_rms_V,m.current_rms_A];
+    export_run(data_dir,['tracking_',methods{j}],tracking{j});
+    export_run(data_dir,['step_',methods{j}],steps{j});
+end
+% Only the plant/noise is perturbed: PID tuning and nominal KF are unchanged.
+cases = {'noise_x0p5','noise_x1','noise_x2','noise_x5', ...
+    'J_x0p5','J_x0p8','J_x1p2','J_x1p5','b_x0p5','b_x0p8','b_x1p2','b_x1p5'};
+scales = [0.5 1 1;1 1 1;2 1 1;5 1 1; ...
+    1 0.5 1;1 0.8 1;1 1.2 1;1 1.5 1; ...
+    1 1 0.5;1 1 0.8;1 1 1.2;1 1 1.5];
+robustness = cell(numel(cases),1); table3 = zeros(numel(cases),2);
+for j=1:numel(cases)
+    robustness{j}=simulate(cfg,'kf','sine',scales(j,1),scales(j,2),scales(j,3),noise);
+    m=robustness{j}.metrics;
+    table3(j,:)=[m.kf_angle_rmse_deg,m.angle_rmse_deg];
+    export_run(data_dir,['robustness_',cases{j}],robustness{j});
+end
+write_rows(fullfile(data_dir,'table2_controller_comparison.csv'), ...
+    {'method','angle_rmse_deg','velocity_rmse_deg_s','settling_s', ...
+    'overshoot_pct','voltage_rms_V','current_rms_A'},methods,table2);
+write_rows(fullfile(data_dir,'table3_robustness.csv'), ...
+    {'case','kf_angle_rmse_deg','tracking_angle_rmse_deg'},cases,table3);
+write_rows(fullfile(data_dir,'robustness_configuration.csv'), ...
+    {'case','noise_std_multiplier','plant_J_multiplier','plant_b_multiplier'},cases,scales);
+export_configuration(data_dir,cfg);
+
+kf=tracking{3}; mask=kf.t>=cfg.metric_start;
+% Compare KF and an offline LPF on the SAME encoder trace/true trajectory.
+phase_kf = phase_difference(kf.t(mask),kf.theta(mask),kf.estimate(mask,1),cfg.ref_Hz);
+phase_lpf = phase_difference(kf.t(mask),kf.theta(mask),kf.lpf(mask),cfg.ref_Hz);
+% Continuous nominal linearization around theta=0, ignoring Coulomb friction,
+% saturation, disturbance, sampling delay, and estimator dynamics.
+poly = [cfg.J*cfg.Ra, cfg.b*cfg.Ra+cfg.Kt*cfg.Ke+cfg.Kt*cfg.Kd, ...
+    cfg.mass*cfg.gravity*cfg.length*cfg.Ra+cfg.Kt*cfg.Kp,cfg.Kt*cfg.Ki];
+plant_poles = roots(poly);
+Ksteady=kf.K(:,:,end); Psteady=kf.P(:,:,end);
+estimator_eigenvalues=eig((eye(2)-Ksteady*cfg.H)*cfg.A);
+write_numeric(fullfile(data_dir,'nominal_poles.csv'),{'real','imag'},[real(plant_poles),imag(plant_poles)]);
+write_numeric(fullfile(data_dir,'nominal_characteristic_polynomial.csv'), ...
+    {'s3','s2','s1','s0'},poly);
+write_numeric(fullfile(data_dir,'estimator_eigenvalues.csv'),{'real','imag'}, ...
+    [real(estimator_eigenvalues),imag(estimator_eigenvalues)]);
+phase_design=[sin(2*pi*cfg.ref_Hz*kf.t(mask)),cos(2*pi*cfg.ref_Hz*kf.t(mask)),ones(sum(mask),1)];
+phase_coefficients=phase_design\[kf.theta(mask),kf.estimate(mask,1),kf.lpf(mask)];
+write_rows(fullfile(data_dir,'phase_fit_coefficients.csv'), ...
+    {'signal','sin_coefficient_rad','cos_coefficient_rad','offset_rad'}, ...
+    {'true_angle','kf_angle','offline_lpf_angle'},phase_coefficients');
+write_rows(fullfile(data_dir,'phase_comparison.csv'), ...
+    {'estimate','signed_phase_difference_deg','absolute_phase_difference_deg'}, ...
+    {'kf','offline_lpf'},[phase_kf,abs(phase_kf);phase_lpf,abs(phase_lpf)]);
+
+results=struct('configuration',cfg,'noise_source',noise_source,'noise',noise, ...
+    'tracking',{tracking},'steps',{steps},'robustness',{robustness}, ...
+    'robustness_cases',{cases},'robustness_scales',scales, ...
+    'table2',table2,'table3',table3,'phase_kf_deg',phase_kf, ...
+    'phase_lpf_deg',phase_lpf,'nominal_poles',plant_poles, ...
+    'estimator_eigenvalues',estimator_eigenvalues,'software_version',version);
+results.audit=manuscript_audit(data_dir,results,Ksteady,Psteady);
+save(fullfile(output_dir,'simulation_results.mat'),'results','-v7');
+fid=fopen(fullfile(output_dir,'run_info.txt'),'w'); assert(fid>=0);
+fprintf(fid,'Software: %s\nNoise source: %s\n',version,noise_source);
+fprintf(fid,'Tracking and primary estimation metrics: 1 <= t <= 5 seconds.\n');
+fprintf(fid,'Settling: first sample after last violation of 2%% step band through 5 s; NaN if not settled.\n');
+fprintf(fid,'Total audit rows: %d; rows within stated manuscript rounding: %d.\n', ...
+    size(results.audit,1),sum(results.audit(:,4)));
+fclose(fid);
+if make_figures
+    figures_dir=fullfile(output_dir,'figures');
+    if ~exist(figures_dir,'dir'), mkdir(figures_dir); end
+    make_plots(figures_dir,tracking,steps,cfg);
+end
+fprintf('\nComputed Table 2 (encoder, LPF, KF):\n'); disp(table2);
+fprintf('Manuscript audit: %d / %d rows match the stated rounding.\n', ...
+    sum(results.audit(:,4)),size(results.audit,1));
+fprintf('Saved numerical data and complete workspace to %s\n',output_dir);
+if ~all(results.audit(:,4))
+    fprintf('ACTION REQUIRED: review manuscript_comparison.csv before claiming reproduction.\n');
+end
 end
 
-xline(settling_time, 'g--', ['Settling Time (t=', num2str(round(settling_time, 2)), 's)'], 'LineWidth', 1.5, 'HandleVisibility', 'off');
-max_error_pid = round(max(abs(error_pid_deg(1,:))), 2);
-text(2.5, 5, ['Max Transient Error: ', num2str(max_error_pid), ' deg'], 'FontSize', 10);
-xlabel('Time (s)', 'FontSize', 11); ylabel('PID Error (deg)', 'FontSize', 11);
-title('PID Controller Angle Error Curve (Based on Fused Data)', 'FontSize', 12);
-legend(p2_1, 'Location', 'northeast', 'FontSize', 9);
-
-% 图3：PID控制输出电压（文档“PID控制量特性”分析）
-figure(3); hold on; grid on; grid minor;
-p3_1 = plot(t, u_pid, 'g-', 'LineWidth', 2, 'DisplayName', 'PID Output Voltage');
-yline(24, 'r--', 'Voltage Upper Limit (+24V)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(-24, 'r--', 'Voltage Lower Limit (-24V)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-text(0.2, 18, ['Peak Voltage: ', num2str(round(max(u_pid(1,:)), 1)), ' V'], 'FontSize', 10);
-xlabel('Time (s)', 'FontSize', 11); ylabel('PID Output Voltage (V)', 'FontSize', 11);
-title('PID Controller Output Voltage Dynamic Characteristics', 'FontSize', 12);
-legend(p3_1, 'Location', 'southwest', 'FontSize', 9);
-
-% 图4：电枢电流与输出力矩（文档“动力学模型输出”分析）
-figure(4); hold on; grid on; grid minor;
-p4_1 = plot(t, current, 'c-', 'LineWidth', 2, 'DisplayName', 'Armature Current');
-p4_2 = plot(t, motor_torque_output, 'k-^', 'LineWidth', 2, 'MarkerSize', 1.5, 'DisplayName', 'Motor Output Torque');
-yline(10, 'r--', 'Current Upper Limit (+10A)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(-10, 'r--', 'Current Lower Limit (-10A)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Current (A) / Torque (N·m)', 'FontSize', 11);
-title('Robotic Joint Armature Current and Motor Output Torque', 'FontSize', 12);
-legend([p4_1, p4_2], 'Location', 'northeast', 'FontSize', 9);
-
-% 图5：双传感器原始测量对比（文档“多传感器特性差异”验证）
-figure(5); hold on; grid on; grid minor;
-p5_1 = plot(t, theta_gyro_deg, 'o-', 'Color', [1, 0.5, 0], 'LineWidth', 2, 'MarkerSize', 1.5, 'DisplayName', 'Gyroscope Measurement');
-p5_2 = plot(t, theta_enc_deg, 'o-', 'Color', [0.5, 0, 0.5], 'LineWidth', 2, 'MarkerSize', 1.5, 'DisplayName', 'Encoder Measurement');
-text(3, 34, ['Gyro Noise: \pm', num2str(gyro_noise_std), ' deg'], 'FontSize', 10, 'Color', [1, 0.5, 0]);
-text(3, 32.5, ['Encoder Noise: \pm', num2str(enc_noise_std), ' deg'], 'FontSize', 10, 'Color', [0.5, 0, 0.5]);
-xlabel('Time (s)', 'FontSize', 11); ylabel('Measured Angle (deg)', 'FontSize', 11);
-title('Comparison of Gyroscope and Encoder Raw Angle Measurements', 'FontSize', 12);
-legend([p5_1, p5_2], 'Location', 'northwest', 'FontSize', 9);
-
-% 图6：传感器融合结果与实际角度对比（文档“融合有效性”验证）
-figure(6); hold on; grid on; grid minor;
-p6_1 = plot(t, theta_actual_deg, 'b-', 'LineWidth', 2, 'DisplayName', 'Actual Angle');
-p6_2 = plot(t, theta_fused_deg, 'r--', 'LineWidth', 2.5, 'DisplayName', 'Kalman Fused Angle');
-fusion_max_dev = round(max(abs(theta_fused_deg - theta_actual_deg)), 3);
-text(2, 28, ['Max Fusion Deviation: ', num2str(fusion_max_dev), ' deg'], 'FontSize', 10, 'Color', 'red');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Angle (deg)', 'FontSize', 11);
-title('Comparison of Fused Angle and Actual Angle', 'FontSize', 12);
-legend([p6_1, p6_2], 'Location', 'northwest', 'FontSize', 9);
-
-% 图7：三种测量误差对比（文档“融合精度提升”验证）
-figure(7); hold on; grid on; grid minor;
-error_gyro = theta_gyro_deg - theta_actual_deg;
-error_enc = theta_enc_deg - theta_actual_deg;
-error_fused_theta = theta_fused_deg - theta_actual_deg;
-rmse_gyro = round(sqrt(mean(error_gyro(1,:).^2)), 3);
-rmse_enc = round(sqrt(mean(error_enc(1,:).^2)), 3);
-rmse_fused_theta = round(sqrt(mean(error_fused_theta(1,:).^2)), 3);
-
-p7_1 = plot(t, error_gyro, 'o-', 'Color', [1, 0.5, 0], 'LineWidth', 2, 'MarkerSize', 1, 'DisplayName', 'Gyroscope Error');
-p7_2 = plot(t, error_enc, 'o-', 'Color', [0.5, 0, 0.5], 'LineWidth', 2, 'MarkerSize', 1, 'DisplayName', 'Encoder Error');
-p7_3 = plot(t, error_fused_theta, 'g-', 'LineWidth', 2.5, 'DisplayName', 'Fused Angle Error');
-
-text(2, 0.4, ['Gyro RMSE: ', num2str(rmse_gyro), ' deg'], 'FontSize', 9, 'Color', [1, 0.5, 0]);
-text(2, 0.3, ['Encoder RMSE: ', num2str(rmse_enc), ' deg'], 'FontSize', 9, 'Color', [0.5, 0, 0.5]);
-text(2, 0.2, ['Fused RMSE: ', num2str(rmse_fused_theta), ' deg'], 'FontSize', 9, 'Color', 'green');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Measurement Error (deg)', 'FontSize', 11);
-title('Comparison of Gyro, Encoder, and Fused Angle Measurement Errors', 'FontSize', 12);
-legend([p7_1, p7_2, p7_3], 'Location', 'northeast', 'FontSize', 9);
-
-% 图8：卡尔曼滤波增益变化（文档“滤波收敛特性”分析）
-figure(8); hold on; grid on; grid minor;
-p8_1 = plot(t, squeeze(K(1,1,:)), 'r-', 'LineWidth', 2, 'DisplayName', 'K11 (Angle Gain)');
-p8_2 = plot(t, squeeze(K(1,2,:)), 'g-', 'LineWidth', 2, 'DisplayName', 'K12 (Angular Velocity-to-Angle Gain)');
-p8_3 = plot(t, squeeze(K(2,1,:)), 'b-', 'LineWidth', 2, 'DisplayName', 'K21 (Angle-to-Angular Velocity Gain)');
-p8_4 = plot(t, squeeze(K(2,2,:)), 'm-', 'LineWidth', 2, 'DisplayName', 'K22 (Angular Velocity Gain)');
-xline(0.5, 'k--', 'Gain Stabilization Start (t=0.5s)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-text(3, 0.6, 'Gain fluctuation <0.05 after stabilization', 'FontSize', 10);
-xlabel('Time (s)', 'FontSize', 11); ylabel('Kalman Gain', 'FontSize', 11);
-title('Dynamic Change of Kalman Filter Gain Matrix', 'FontSize', 12);
-legend([p8_1, p8_2, p8_3, p8_4], 'Location', 'southeast', 'FontSize', 8);
-
-% 图9：卡尔曼滤波角度估计协方差变化（文档“状态不确定性降低”验证）
-figure(9); hold on; grid on; grid minor;
-p9_1 = plot(t, squeeze(P_est(1,1,:)), 'k-', 'LineWidth', 2, 'DisplayName', 'Angle Estimation Covariance');
-cov_stable = round(squeeze(P_est(1,1,end)), 4);
-xline(0.3, 'g--', 'Covariance Settling Time (t=0.3s)', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-text(2, 0.2, ['Stable Covariance: ', num2str(cov_stable), ' rad²'], 'FontSize', 10);
-xlabel('Time (s)', 'FontSize', 11); ylabel('Angle Estimation Covariance (rad²)', 'FontSize', 11);
-title('Dynamic Change of Kalman Filter Angle Estimation Covariance', 'FontSize', 12);
-legend(p9_1, 'Location', 'northeast', 'FontSize', 9);
-
-% 图10：机器人角速度跟踪效果（文档“动态响应性能”验证）
-figure(10); hold on; grid on; grid minor;
-p10_1 = plot(t, omega_actual_deg, 'b-', 'LineWidth', 2, 'DisplayName', 'Actual Angular Velocity');
-p10_2 = plot(t, omega_ref_deg, 'r--', 'LineWidth', 2.5, 'DisplayName', 'Reference Angular Velocity (62.8cos(2πt))');
-p10_3 = plot(t, omega_fused_deg, 'g-.', 'LineWidth', 2, 'DisplayName', 'Fused Angular Velocity');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Angular Velocity (deg/s)', 'FontSize', 11);
-title('Robotic Joint Angular Velocity Tracking Performance', 'FontSize', 12);
-legend([p10_1, p10_2, p10_3], 'Location', 'southeast', 'FontSize', 9);
-
-%% 7. 绘制新增的4张仿真图，模拟MuJoCo或Webots环境下的特性
-% 新增图11：机器人关节角度跟踪性能
-figure(11); hold on; grid on; grid minor;
-p11_1 = plot(t, theta_ref_deg, 'r-', 'LineWidth', 2, 'DisplayName', 'Reference Angle');
-p11_2 = plot(t, theta_actual_deg, 'b-', 'LineWidth', 2, 'DisplayName', 'Actual Angle (with Disturbances)');
-p11_3 = plot(t, theta_fused_deg, 'g--', 'LineWidth', 2, 'DisplayName', 'Kalman Fused Angle');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Angle (deg)', 'FontSize', 11);
-title('Joint Angle Tracking Performance', 'FontSize', 12);
-legend([p11_1, p11_2, p11_3], 'Location', 'northwest', 'FontSize', 9);
-
-% 新增图12：控制电压和电流
-figure(12); hold on; grid on; grid minor;
-yyaxis left;
-p12_1 = plot(t, u_pid, 'Color', [0.85, 0.33, 0.1], 'LineWidth', 2, 'DisplayName', 'PID Output Voltage (V)');
-ylabel('Voltage (V)', 'FontSize', 11);
-yyaxis right;
-p12_2 = plot(t, current, 'Color', [0.47, 0.67, 0.19], 'LineWidth', 2, 'DisplayName', 'Armature Current (A)');
-ylabel('Current (A)', 'FontSize', 11);
-yline(24, 'r--', 'V_{max}', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(-24, 'r--', 'V_{min}', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(10, 'b:', 'I_{max}', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-yline(-10, 'b:', 'I_{min}', 'LineWidth', 1.5, 'HandleVisibility', 'off');
-xlabel('Time (s)', 'FontSize', 11);
-title('PID Control Output Voltage and Armature Current', 'FontSize', 12);
-legend([p12_1, p12_2], 'Location', 'southwest', 'FontSize', 9);
-
-% 新增图13：关节所受扰动力矩分解
-figure(13); hold on; grid on; grid minor;
-p13_1 = plot(t, motor_torque_output, 'k-', 'LineWidth', 2, 'DisplayName', 'Motor Output Torque');
-p13_2 = plot(t, friction_torque_hist, 'm--', 'LineWidth', 2, 'DisplayName', 'Friction Torque');
-p13_3 = plot(t, gravity_torque_hist, 'c-.', 'LineWidth', 2, 'DisplayName', 'Gravity Torque');
-p13_4 = plot(t, disturbance_torque_hist, 'Color', [0.93, 0.69, 0.13], 'LineWidth', 2, 'DisplayName', 'External Disturbance Torque');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Torque (N·m)', 'FontSize', 11);
-title('Joint Disturbance Torque Decomposition', 'FontSize', 12);
-legend([p13_1, p13_2, p13_3, p13_4], 'Location', 'northwest', 'FontSize', 9);
-
-% 新增图14：角速度跟踪与融合效果
-figure(14); hold on; grid on; grid minor;
-p14_1 = plot(t, omega_ref_deg, 'r-', 'LineWidth', 2, 'DisplayName', 'Reference Angular Velocity');
-p14_2 = plot(t, omega_actual_deg, 'b-', 'LineWidth', 2, 'DisplayName', 'Actual Angular Velocity (with Disturbances)');
-p14_3 = plot(t, omega_fused_deg, 'g--', 'LineWidth', 2, 'DisplayName', 'Kalman Fused Angular Velocity');
-xlabel('Time (s)', 'FontSize', 11); ylabel('Angular Velocity (deg/s)', 'FontSize', 11);
-title('Robotic Joint Angular Velocity Tracking and Fusion Performance', 'FontSize', 12);
-legend([p14_1, p14_2, p14_3], 'Location', 'northwest', 'FontSize', 9);
-
-
-%% 8. 输出关键性能指标（文档“仿真结果量化分析”需求）
-fprintf('=== Performance Metrics of PID and Sensor Fusion for Robotic System (with MuJoCo/Webots-style Disturbances) ===\n');
-fprintf('1. PID Control Steady-State Angle Error (based on fusion): %.3f deg\n', abs(error_pid_deg(1, end)));
-fprintf('2. Gyroscope Raw Angle Measurement RMSE: %.3f deg\n', rmse_gyro);
-fprintf('3. Encoder Raw Angle Measurement RMSE: %.3f deg\n', rmse_enc);
-fprintf('4. Fused Angle RMSE (compared to actual value): %.3f deg\n', rmse_fused_theta);
-fprintf('5. Angle Tracking Settling Time (within ±0.5 degree error band): %.2f s\n', settling_time);
-
-
-%% 9. 自定义单位转换函数（匹配文档角度/弧度运算需求）
-function rad = deg2rad(deg)
-    rad = deg * pi / 180;
+function c=configuration()
+c.dt=0.001; c.duration=5; c.metric_start=1; c.seed=42;
+c.J=0.5; c.b=0.2; c.Kt=1; c.Ke=1; c.Ra=2;
+c.Fc=0.8; c.friction_deadband=1e-3; c.mass=1; c.length=0.5; c.gravity=9.81;
+c.disturbance_Nm=1.5; c.disturbance_Hz=5;
+c.ref_offset_deg=30; c.ref_amplitude_deg=5; c.ref_Hz=1;
+c.Kp=25; c.Ki=20; c.Kd=5; c.voltage_limit=24; c.current_limit=10;
+c.encoder_std=0.2*pi/180; c.gyro_std=0.5*pi/180;
+c.lpf_Hz=10; c.lpf_alpha=c.dt/(1/(2*pi*c.lpf_Hz)+c.dt);
+c.A=[1 c.dt;0 1]; c.B=[c.dt^2/(2*c.J);c.dt/c.J]; c.H=eye(2);
+c.Q=diag([5e-7,1e-4]); c.R=diag([c.encoder_std^2,c.gyro_std^2]);
+c.x0=[0;0]; c.P0=eye(2); c.step_band_fraction=0.02;
 end
 
-function deg = rad2deg(rad)
-    deg = rad * 180 / pi;
+function s=simulate(c,method,reference,noise_scale,J_scale,b_scale,noise)
+s.t=(0:c.dt:c.duration)'; n=numel(s.t);
+s.reference=(c.ref_offset_deg+c.ref_amplitude_deg*sin(2*pi*c.ref_Hz*s.t))*pi/180;
+s.reference_velocity=c.ref_amplitude_deg*2*pi*c.ref_Hz*cos(2*pi*c.ref_Hz*s.t)*pi/180;
+if strcmp(reference,'step')
+    s.reference(:)=c.ref_offset_deg*pi/180; s.reference_velocity(:)=0;
+end
+s.theta=zeros(n,1); s.omega=zeros(n,1); s.encoder=zeros(n,1); s.gyro=zeros(n,1);
+s.estimate=zeros(n,2); s.estimate(1,:)=c.x0'; s.lpf=zeros(n,1);
+s.voltage_command=zeros(n,1); s.voltage=zeros(n,1); s.current=zeros(n,1);
+s.motor_torque=zeros(n,1); s.friction_torque=zeros(n,1);
+s.gravity_torque=zeros(n,1); s.disturbance_torque=zeros(n,1);
+s.pid_error=zeros(n,1); s.feedback_used=zeros(n,1);
+s.P=zeros(2,2,n); s.P(:,:,1)=c.P0; s.K=zeros(2,2,n);
+integral_error=0; previous_error=0;
+for k=2:n
+    switch method
+        case 'encoder', feedback=s.encoder(k-1);
+        case 'lpf', feedback=s.lpf(k-1);
+        case 'kf', feedback=s.estimate(k-1,1);
+        otherwise, error('Unknown feedback method');
+    end
+    e=s.reference(k)-feedback;
+    integral_error=integral_error+e*c.dt; % Original positional PID; no anti-windup.
+    derivative=(e-previous_error)/c.dt;
+    s.voltage_command(k)=c.Kp*e+c.Ki*integral_error+c.Kd*derivative;
+    previous_error=e; s.pid_error(k)=e; s.feedback_used(k)=feedback;
+    s.voltage(k)=min(max(s.voltage_command(k),-c.voltage_limit),c.voltage_limit);
+    current=(s.voltage(k)-c.Ke*s.omega(k-1))/c.Ra;
+    s.current(k)=min(max(current,-c.current_limit),c.current_limit);
+    s.motor_torque(k)=c.Kt*s.current(k);
+    coulomb=c.Fc*sign(s.omega(k-1));
+    if abs(s.omega(k-1))<c.friction_deadband, coulomb=0; end
+    s.friction_torque(k)=c.b*b_scale*s.omega(k-1)+coulomb;
+    s.gravity_torque(k)=c.mass*c.gravity*c.length*sin(s.theta(k-1));
+    s.disturbance_torque(k)=c.disturbance_Nm*sin(2*pi*c.disturbance_Hz*s.t(k));
+    net=s.motor_torque(k)-s.friction_torque(k)-s.gravity_torque(k)-s.disturbance_torque(k);
+    s.omega(k)=s.omega(k-1)+net/(c.J*J_scale)*c.dt;
+    s.theta(k)=s.theta(k-1)+s.omega(k)*c.dt; % Semi-implicit Euler, as original.
+    s.encoder(k)=s.theta(k)+noise_scale*c.encoder_std*noise(k,1);
+    s.gyro(k)=s.omega(k)+noise_scale*c.gyro_std*noise(k,2);
+    s.lpf(k)=s.lpf(k-1)+c.lpf_alpha*(s.encoder(k)-s.lpf(k-1));
+    xp=c.A*s.estimate(k-1,:)'+c.B*s.motor_torque(k);
+    pp=c.A*s.P(:,:,k-1)*c.A'+c.Q;
+    gain=(pp*c.H')/(c.H*pp*c.H'+c.R);
+    s.estimate(k,:)=(xp+gain*([s.encoder(k);s.gyro(k)]-c.H*xp))';
+    % Joseph form protects covariance symmetry/positive semidefiniteness.
+    update=eye(2)-gain*c.H;
+    s.P(:,:,k)=update*pp*update'+gain*c.R*gain'; s.K(:,:,k)=gain;
+end
+s.method=method; s.reference_type=reference;
+s.scales=[noise_scale,J_scale,b_scale];
+s.metrics=measure(s,c);
+assert(all(isfinite(s.theta)) && all(isfinite(s.estimate(:))),'Nonfinite simulation result');
+assert(max(abs(s.voltage))<=c.voltage_limit+1e-12,'Voltage limit violated');
+assert(max(abs(s.current))<=c.current_limit+1e-12,'Current limit violated');
+end
+
+function m=measure(s,c)
+q=s.t>=c.metric_start; d=180/pi; rm=@(x)sqrt(mean(x.^2));
+m.angle_rmse_deg=rm((s.reference(q)-s.theta(q))*d);
+m.velocity_rmse_deg_s=rm((s.reference_velocity(q)-s.omega(q))*d);
+m.angle_max_abs_deg=max(abs((s.reference(q)-s.theta(q))*d));
+m.velocity_max_abs_deg_s=max(abs((s.reference_velocity(q)-s.omega(q))*d));
+m.voltage_rms_V=rm(s.voltage(q)); m.current_rms_A=rm(s.current(q));
+m.encoder_rmse_deg=rm((s.encoder(q)-s.theta(q))*d);
+m.gyro_rmse_deg_s=rm((s.gyro(q)-s.omega(q))*d);
+m.kf_angle_rmse_deg=rm((s.estimate(q,1)-s.theta(q))*d);
+m.kf_velocity_rmse_deg_s=rm((s.estimate(q,2)-s.omega(q))*d);
+% Also provide full-record estimation metrics: the draft does not specify
+% the estimation window as clearly as it specifies the tracking window.
+m.encoder_rmse_full_deg=rm((s.encoder-s.theta)*d);
+m.gyro_rmse_full_deg_s=rm((s.gyro-s.omega)*d);
+m.kf_angle_rmse_full_deg=rm((s.estimate(:,1)-s.theta)*d);
+m.kf_velocity_rmse_full_deg_s=rm((s.estimate(:,2)-s.omega)*d);
+m.settling_s=NaN; m.overshoot_pct=NaN;
+if strcmp(s.reference_type,'step')
+    target=c.ref_offset_deg*pi/180;
+    outside=find(abs(s.theta-target)>c.step_band_fraction*abs(target));
+    if isempty(outside), m.settling_s=0;
+    elseif outside(end)<numel(s.t), m.settling_s=s.t(outside(end)+1); end
+    m.overshoot_pct=max(0,(max(s.theta)-target)/abs(target)*100);
+end
+end
+
+function export_run(folder,name,s)
+d=180/pi;
+headers={'time_s','reference_angle_deg','reference_velocity_deg_s','true_angle_deg', ...
+    'true_velocity_deg_s','encoder_angle_deg','gyro_velocity_deg_s','kf_angle_deg', ...
+    'kf_velocity_deg_s','lpf_angle_deg','voltage_command_V','applied_voltage_V', ...
+    'current_A','motor_torque_Nm','friction_torque_Nm','gravity_torque_Nm', ...
+    'disturbance_torque_Nm','controller_error_deg','feedback_used_deg', ...
+    'tracking_error_deg','velocity_tracking_error_deg_s','encoder_error_deg', ...
+    'gyro_error_deg_s','kf_angle_error_deg','kf_velocity_error_deg_s', ...
+    'K11','K12_s','K21_per_s','K22','P11_rad2','P12_rad2_per_s','P22_rad2_per_s2','P11_deg2'};
+data=[s.t,s.reference*d,s.reference_velocity*d,s.theta*d,s.omega*d,s.encoder*d, ...
+    s.gyro*d,s.estimate*d,s.lpf*d,s.voltage_command,s.voltage,s.current, ...
+    s.motor_torque,s.friction_torque,s.gravity_torque,s.disturbance_torque, ...
+    s.pid_error*d,s.feedback_used*d,(s.reference-s.theta)*d, ...
+    (s.reference_velocity-s.omega)*d,(s.encoder-s.theta)*d,(s.gyro-s.omega)*d, ...
+    (s.estimate(:,1)-s.theta)*d,(s.estimate(:,2)-s.omega)*d, ...
+    squeeze(s.K(1,1,:)),squeeze(s.K(1,2,:)),squeeze(s.K(2,1,:)),squeeze(s.K(2,2,:)), ...
+    squeeze(s.P(1,1,:)),squeeze(s.P(1,2,:)),squeeze(s.P(2,2,:)),squeeze(s.P(1,1,:))*d^2];
+write_numeric(fullfile(folder,[name,'.csv']),headers,data);
+names=fieldnames(s.metrics); values=zeros(numel(names),1);
+for j=1:numel(names), values(j)=s.metrics.(names{j}); end
+write_rows(fullfile(folder,[name,'_metrics.csv']),{'metric','value'},names,values);
+end
+
+function export_configuration(folder,c)
+names=fieldnames(c); labels={}; values=[];
+for j=1:numel(names)
+    v=c.(names{j});
+    if isscalar(v)
+        labels{end+1}=names{j}; values(end+1,1)=v;
+    else
+        for row=1:size(v,1)
+            for col=1:size(v,2)
+                labels{end+1}=sprintf('%s_%d_%d',names{j},row,col);
+                values(end+1,1)=v(row,col);
+            end
+        end
+    end
+end
+write_rows(fullfile(folder,'configuration.csv'),{'parameter','value'},labels,values);
+end
+
+function difference=phase_difference(t,truth,estimate,freq)
+design=[sin(2*pi*freq*t),cos(2*pi*freq*t),ones(numel(t),1)];
+a=design\truth; b=design\estimate;
+difference=(atan2(b(2),b(1))-atan2(a(2),a(1)))*180/pi;
+difference=mod(difference+180,360)-180;
+end
+
+function out=manuscript_audit(folder,r,K,P)
+% Published values are ONLY audit references. They never enter simulation,
+% noise generation, tuning, data export, or plotting.
+reported2=[4.580 19.421 3.968 1.264 17.842 7.868; ...
+    2.895 16.646 3.119 0.472 5.282 2.614; ...
+    2.962 16.990 2.952 0.487 6.165 3.061];
+reported3=[.032 2.968;.065 2.962;.129 2.979;.323 3.639; ...
+    .065 2.679;.065 2.869;.065 3.039;.064 3.152; ...
+    .065 2.958;.065 2.960;.065 2.963;.065 2.967];
+labels={}; reported=[]; computed=[]; tolerance=[];
+methods={'encoder','lpf','kf'}; fields={'angle_rmse','velocity_rmse','settling','overshoot','Vrms','Irms'};
+for j=1:3
+    for k=1:6
+        labels{end+1}=['Table2_',methods{j},'_',fields{k}];
+        reported(end+1,1)=reported2(j,k); computed(end+1,1)=r.table2(j,k); tolerance(end+1,1)=0.0005;
+    end
+end
+for j=1:12
+    for k=1:2
+        labels{end+1}=sprintf('Table3_%s_column%d',r.robustness_cases{j},k);
+        reported(end+1,1)=reported3(j,k); computed(end+1,1)=r.table3(j,k); tolerance(end+1,1)=0.0005;
+    end
+end
+m=r.tracking{3}.metrics;
+extra_names={'encoder_estimation_rmse_deg','gyro_estimation_rmse_deg_s', ...
+    'kf_estimation_rmse_deg','kf_velocity_estimation_rmse_deg_s', ...
+    'encoder_tracking_max_deg','kf_velocity_tracking_max_deg_s', ...
+    'kf_abs_phase_deg','lpf_abs_phase_deg','K11','K12','K21','K22','P11_deg2', ...
+    'estimator_eigenvalue_large','estimator_eigenvalue_small', ...
+    'nominal_real_pole','nominal_complex_real','nominal_complex_imag'};
+extra_reported=[.200;.507;.065;.389;10.398;26.526;.09;5.76;.183;.00025;.0016;.664;.0073;.817;.336;-.643;-2.879;4.777];
+real_pole=r.nominal_poles(abs(imag(r.nominal_poles))<1e-10);
+complex_pole=r.nominal_poles(imag(r.nominal_poles)>0);
+extra_computed=[m.encoder_rmse_deg;m.gyro_rmse_deg_s;m.kf_angle_rmse_deg;m.kf_velocity_rmse_deg_s; ...
+    r.tracking{1}.metrics.angle_max_abs_deg;m.velocity_max_abs_deg_s;abs(r.phase_kf_deg);abs(r.phase_lpf_deg); ...
+    K(1,1);K(1,2);K(2,1);K(2,2);P(1,1)*(180/pi)^2; ...
+    max(real(r.estimator_eigenvalues));min(real(r.estimator_eigenvalues)); ...
+    real(real_pole);real(complex_pole);imag(complex_pole)];
+extra_tolerance=[repmat(.0005,6,1);.005;.005;.0005;.000005;.00005;.0005;.00005;repmat(.0005,5,1)];
+labels=[labels,extra_names]; reported=[reported;extra_reported]; computed=[computed;extra_computed]; tolerance=[tolerance;extra_tolerance];
+delta=computed-reported; matches=isfinite(computed)&abs(delta)<=tolerance+1e-12;
+out=[reported,computed,delta,double(matches),tolerance];
+write_rows(fullfile(folder,'manuscript_comparison.csv'), ...
+    {'item','manuscript_value','computed_value','computed_minus_manuscript','matches_rounding','rounding_tolerance'},labels,out);
+end
+
+function write_numeric(path,headers,data)
+assert(size(data,2)==numel(headers),'CSV column mismatch');
+fid=fopen(path,'w'); assert(fid>=0,'Cannot open output file');
+closer=onCleanup(@()fclose(fid));
+fprintf(fid,'%s\n',strjoin(headers,','));
+fmt=[repmat('%.17g,',1,size(data,2)-1),'%.17g\n'];
+fprintf(fid,fmt,data');
+end
+
+function write_rows(path,headers,names,data)
+assert(size(data,1)==numel(names) && size(data,2)==numel(headers)-1,'CSV dimension mismatch');
+fid=fopen(path,'w'); assert(fid>=0,'Cannot open output file');
+closer=onCleanup(@()fclose(fid)); fprintf(fid,'%s\n',strjoin(headers,','));
+for j=1:numel(names)
+    fprintf(fid,'%s',names{j}); fprintf(fid,',%.17g',data(j,:)); fprintf(fid,'\n');
+end
+end
+
+function make_plots(folder,tr,st,c)
+d=180/pi; en=tr{1}; kf=tr{3}; t=kf.t;
+f=new_figure(); axis([0 1 0 1]); axis off; hold on;
+box_at([.02 .65 .16 .18],{'Reference','angle'});
+box_at([.25 .65 .16 .18],{'Discrete','PID'});
+box_at([.48 .65 .19 .18],{'Voltage/current','limits + motor'});
+box_at([.74 .65 .23 .18],{'Joint dynamics','friction + gravity','+ disturbance'});
+box_at([.73 .20 .24 .19],{'Encoder angle','Gyroscope velocity','+ measurement noise'});
+box_at([.26 .20 .29 .19],{'Kalman prediction/update','nominal model + torque','or encoder / LPF baseline'});
+arrow_at([.18 .74],[.25 .74]); arrow_at([.41 .74],[.48 .74]);
+arrow_at([.67 .74],[.74 .74]); arrow_at([.86 .65],[.86 .39]);
+arrow_at([.73 .29],[.55 .29]); arrow_at([.33 .39],[.33 .65]);
+text(.35,.50,'Previous-sample feedback','FontSize',10);
+title('Figure 1  Simulated control and measurement architecture'); finish(f,folder,'figure01');
+f=new_figure(); plot(en.t,[en.reference,en.theta]*d,'LineWidth',1.2);
+label_plot('Figure 2  Encoder-only PID tracking','Angle (deg)',{'Reference','True joint angle'}); finish(f,folder,'figure02');
+f=new_figure(); plot(en.t,(en.reference-en.theta)*d,'LineWidth',1.2);
+label_plot('Figure 3  Encoder-only PID tracking error','Reference - true angle (deg)',{}); finish(f,folder,'figure03');
+f=new_figure(); plot(en.t,en.voltage,'LineWidth',0.8);
+label_plot('Figure 4  Applied voltage','Voltage (V)',{}); finish(f,folder,'figure04');
+f=new_figure(); subplot(2,1,1); plot(en.t,en.current,'LineWidth',0.8);
+label_plot('Figure 5  Encoder-only PID actuator response','Current (A)',{});
+subplot(2,1,2); plot(en.t,en.motor_torque,'LineWidth',0.8);
+label_plot('','Motor torque (N m)',{}); finish(f,folder,'figure05');
+f=new_figure(); subplot(2,1,1); plot(t,[kf.theta,kf.encoder]*d,'LineWidth',0.8);
+label_plot('Figure 6  Heterogeneous sensor measurements','Angle (deg)',{'True','Encoder'});
+subplot(2,1,2); plot(t,[kf.omega,kf.gyro]*d,'LineWidth',0.8);
+label_plot('','Angular velocity (deg/s)',{'True','Gyroscope'}); finish(f,folder,'figure06');
+f=new_figure(); subplot(2,1,1); plot(t,[kf.theta,kf.estimate(:,1)]*d,'LineWidth',1.1);
+label_plot('Figure 7  Kalman angle estimate','Angle (deg)',{'True','KF'});
+subplot(2,1,2); q=t>=c.metric_start; plot(t(q),[kf.theta(q),kf.estimate(q,1)]*d,'LineWidth',1.1);
+label_plot('Detail after 1 s','Angle (deg)',{'True','KF'}); finish(f,folder,'figure07');
+f=new_figure(); subplot(2,1,1); plot(t,[kf.encoder-kf.theta,kf.estimate(:,1)-kf.theta]*d,'LineWidth',0.8);
+label_plot('Figure 8  State-estimation errors','Angle error (deg)',{'Encoder','KF'});
+subplot(2,1,2); plot(t,[kf.gyro-kf.omega,kf.estimate(:,2)-kf.omega]*d,'LineWidth',0.8);
+label_plot('','Velocity error (deg/s)',{'Gyroscope','KF'}); finish(f,folder,'figure08');
+f=new_figure(); names={'K11','K12 (s)','K21 (1/s)','K22'};
+for j=1:4
+    rows=[1 1 2 2]; cols=[1 2 1 2]; subplot(2,2,j);
+    plot(t(2:end),squeeze(kf.K(rows(j),cols(j),2:end)),'LineWidth',1.1);
+    label_plot('Kalman gain convergence',names{j},{});
+end
+finish(f,folder,'figure09');
+f=new_figure(); semilogy(t,squeeze(kf.P(1,1,:))*d^2,'LineWidth',1.2);
+label_plot('Figure 10  Angle-estimation covariance','Covariance (deg^2)',{}); finish(f,folder,'figure10');
+f=new_figure(); plot(t,[kf.reference_velocity,kf.omega,kf.estimate(:,2)]*d,'LineWidth',1.1);
+label_plot('Figure 11  Velocity reference and response','Angular velocity (deg/s)',{'Reference','True','KF'}); finish(f,folder,'figure11');
+f=new_figure(); plot(t,[kf.reference,tr{1}.theta,tr{2}.theta,tr{3}.theta]*d,'LineWidth',1.1);
+label_plot('Matched controller comparison','Angle (deg)',{'Reference','Encoder PID','LPF PID','KF PID'}); finish(f,folder,'supplement_controller_comparison');
+f=new_figure(); plot(t,[st{1}.reference,st{1}.theta,st{2}.theta,st{3}.theta]*d,'LineWidth',1.1);
+label_plot('Separate 30-degree step tests','Angle (deg)',{'Reference','Encoder PID','LPF PID','KF PID'}); finish(f,folder,'supplement_step_tests');
+end
+
+function f=new_figure()
+f=figure('Visible','off','Color','w','Position',[100 100 1100 750]);
+if exist('OCTAVE_VERSION','builtin') && any(strcmp(available_graphics_toolkits(),'gnuplot'))
+    graphics_toolkit(f,'gnuplot');
+end
+end
+
+function box_at(p,label)
+rectangle('Position',p,'EdgeColor',[.2 .2 .2],'LineWidth',1.2);
+text(p(1)+p(3)/2,p(2)+p(4)/2,label,'HorizontalAlignment','center','FontSize',10);
+end
+
+function arrow_at(a,b)
+quiver(a(1),a(2),b(1)-a(1),b(2)-a(2),0,'Color',[.15 .15 .15],'LineWidth',1.2,'MaxHeadSize',.3);
+hold on;
+end
+
+function label_plot(heading,vertical,legends)
+grid on; xlabel('Time (s)'); ylabel(vertical); title(heading);
+set(gca,'FontSize',11,'LineWidth',1,'Box','on');
+if ~isempty(legends)
+    if exist('OCTAVE_VERSION','builtin') && strcmp(graphics_toolkit(gcf),'gnuplot')
+        % Octave 6's native legend is not consistently exported by gnuplot.
+        % Put an explicit color key outside the data axes instead.
+        ax=gca; lines=flipud(findobj(ax,'Type','line'));
+        pos=get(ax,'Position'); pos(3)=pos(3)*.77; set(ax,'Position',pos);
+        for k=1:numel(legends)
+            text(1.03,.97-(k-1)*.09,legends{k},'Units','normalized', ...
+                'Color',get(lines(k),'Color'),'FontSize',10, ...
+                'VerticalAlignment','top','Clipping','off','Interpreter','none');
+        end
+    else
+        legend(legends,'Location','best');
+    end
+end
+end
+
+function finish(f,folder,name)
+print(f,fullfile(folder,[name,'.png']),'-dpng','-r180');
+close(f);
 end
