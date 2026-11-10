@@ -1,82 +1,58 @@
-# PID control with Kalman filter sensor fusion
+# pid-kalman-joint-control
 
-Simulation code for **Performance Evaluation of PID Control with Kalman
-Filter-Based Sensor Fusion for Robotic Joints**.
+MATLAB simulation code for a single-joint robotic actuator under PID control with
+Kalman-filter-based multi-sensor fusion (gyroscope + encoder). This repository
+contains all code required to reproduce the results, figures, and performance
+metrics reported in the associated manuscript.
 
-The model compares encoder-only PID, 10-Hz low-pass-filtered PID and KF-PID
-for a single robotic joint. It also includes a 30-degree step test and
-measurement-noise, inertia and damping sensitivity tests.
+> 本仓库包含论文所用的全部 MATLAB 仿真代码：单关节机器人在 PID 控制下，
+> 结合卡尔曼滤波对陀螺仪与编码器进行多传感器融合。运行代码即可复现论文中
+> 所有图与性能指标。
 
-## Run
+## Data availability / 数据说明
 
-Download the repository, open its folder in MATLAB, and enter:
+This study uses **no empirical or third-party data**. All data are generated
+entirely by numerical simulation within `main.m`. Running the script reproduces
+every figure and reported metric.
 
-```matlab
-main
-```
+本研究不使用任何实测数据或第三方数据集，所有数据均由 `main.m` 仿真生成。
+运行脚本即可复现全部结果。
 
-All model parameters and helper functions are included in `main.m`. No
-additional MATLAB toolboxes, Simulink models or private files are required.
-The code is intended for MATLAB R2018b or later and has been tested with
-GNU Octave 6.4.0. Execution under MATLAB itself has not yet been verified.
-To run without generating figures:
+A fixed random seed (`rng(42)`) is set at the top of `main.m` so that the
+stochastic sensor noise is reproducible and the reported numerical results can
+be regenerated exactly.
 
-```matlab
-main('results', false)
-```
+代码开头设置了固定随机种子 `rng(42)`，保证含噪声的仿真结果可被精确复现。
 
-## Data and outputs
+## Requirements / 运行环境
 
-This is a numerical simulation study; no empirical or third-party research
-data are used. Running `main` generates and saves the numerical outputs:
+- MATLAB (R2018b or later recommended)
+- No additional toolboxes required (uses base MATLAB only)
 
-| Location | Contents |
-|---|---|
-| `results/data/tracking_*.csv` | Time series underlying Figures 2–11, with units in column headers |
-| `results/data/step_*.csv` | Separate step-test trajectories and metrics |
-| `results/data/robustness_*.csv` | Sensitivity-test trajectories, settings and metrics |
-| `results/data/configuration.csv` | Model, sensor, controller and filter parameters |
-| `results/data/table2_controller_comparison.csv` | Controller comparison calculated from the trajectories |
-| `results/data/table3_robustness.csv` | Sensitivity comparison calculated from the trajectories |
-| `results/data/phase_*.csv` | Phase estimates and fitting coefficients |
-| `results/data/nominal_*.csv` | Nominal characteristic polynomial and poles |
-| `results/data/estimator_eigenvalues.csv` | Steady estimator error-update eigenvalues |
-| `results/figures/` | Generated figures; Figure 1 is a conceptual diagram |
-| `results/simulation_results.mat` | Complete simulation data, configuration and metrics |
+## How to run / 运行方法
 
-Figures 2–5 use the encoder-only run; Figures 6–11 use the KF-PID run.
-Tracking errors compare the reference with the true simulated state;
-estimation errors compare sensor/filter outputs with that true state.
-Primary metrics use 1–5 s inclusive. Full-record estimation metrics are
-also saved. Step settling uses a 2% band through the 5 s simulation horizon;
-`NaN` means not settled, or not applicable to a sinusoidal run.
+1. Clone or download this repository.
+2. Open MATLAB and set the working directory to the repository folder.
+3. Run:
 
-The LPF uses backward Euler. Phase differences are calculated by fitting a
-1-Hz sinusoid and an intercept over 1–5 s, comparing the KF and an offline
-LPF against the same true trajectory. Controller and KF tuning remain fixed
-in the sensitivity tests. Nominal poles are a local linearized check, not
-a proof of nonlinear closed-loop stability.
+   ```matlab
+   main
+   ```
 
-## Reproducibility
+4. The script will:
+   - Run the closed-loop simulation (0–5 s, step size 0.001 s).
+   - Generate 10 figures covering tracking performance, PID error, control
+     voltage, current/torque, raw sensor measurements, fusion results, error
+     comparison, Kalman gain, estimation covariance, and angular-velocity tracking.
+   - Print key performance metrics to the Command Window (steady-state error,
+     gyroscope MSE, encoder MSE, and fused MSE).
 
-Keep `data/noise_standard.csv` with the code. It contains the common
-normalized encoder and gyroscope noise used by all runs. It was generated
-in GNU Octave 6.4.0 using `randn('state',42)`, with interleaved encoder/gyro
-draws and a zero initialization row. Its SHA-256 is
-`2598fbf544dedfb815950e3cd08d16854ecebc5015148c1a12f5f2780937522b`.
+## File overview / 文件说明
 
-The saved realization avoids differences between MATLAB and Octave random
-number generators. Without this file, the script generates and saves new
-seed-42 noise, whose values may differ between software environments.
-Repeated execution with the included noise reproduced all 47 CSV files
-exactly in the tested environment.
+- `main.m` — complete simulation script (model setup, PID control loop,
+  dynamics, sensor noise, Kalman filter, plotting, and metric output).
 
-This implementation follows the revised manuscript's stated parameters;
-it is not a recovered copy of the program that originally generated the
-manuscript. Some recomputed numbers differ from the reported values.
-`results/data/manuscript_comparison.csv` lists those differences, which
-must be reconciled before claiming reproduction of the unchanged manuscript.
+## Citation / 引用
 
-## License
-
-MIT. See `LICENSE`.
+If you use this code, please cite the associated manuscript.
+(本代码如被使用，请引用对应论文。)
